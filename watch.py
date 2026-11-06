@@ -239,7 +239,26 @@ def main() -> int:
         print("DISCORD_WEBHOOK_URL が未設定です。", file=sys.stderr)
         return 2
 
-    config = yaml.safe_load(raw) or {}
+    try:
+        config = yaml.safe_load(raw) or {}
+    except yaml.YAMLError as exc:
+        print(f"WATCH_CONFIG が YAML として読めません: {exc}", file=sys.stderr)
+        return 2
+
+    # URL をそのまま貼ると文字列として読まれる。実際にあった間違いなので明示する
+    if not isinstance(config, dict):
+        head = raw.strip()[:60]
+        print("WATCH_CONFIG の中身が設定 YAML になっていません。", file=sys.stderr)
+        if head.startswith("http"):
+            print(
+                "  ウェブフック URL が入っているようです。"
+                "DISCORD_WEBHOOK_URL と取り違えていないか確認してください。",
+                file=sys.stderr,
+            )
+        print(f"  先頭: {head}", file=sys.stderr)
+        print("  期待する形: collections: から始まる YAML", file=sys.stderr)
+        return 2
+
     collections = [
         c
         for c in (config.get("collections") or [])
