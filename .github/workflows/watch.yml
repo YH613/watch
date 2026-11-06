@@ -1,0 +1,58 @@
+name: Watch
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'   # 10 分ごと
+  workflow_dispatch:          # 手動実行
+
+# 前の実行が長引いても二重に走らせない
+concurrency:
+  group: watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # ブラウザは毎回落とすと 1 分以上かかる
+      - name: Cache Playwright browser
+        id: pw-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+
+      - name: Install Chromium
+        if: steps.pw-cache.outputs.cache-hit != 'true'
+        run: python -m playwright install chromium --with-deps
+
+      - name: Install Chromium deps
+        if: steps.pw-cache.outputs.cache-hit == 'true'
+        run: python -m playwright install-deps chromium
+
+      # key を固定すると初回以降保存されず、状態が凍結して誤通知が続く。
+      # run_id を入れて毎回保存し、restore-keys で直前を拾う
+      - name: Restore state
+        uses: actions/cache@v4
+        with:
+          path: state.json
+          key: watch-state-${{ github.run_id }}
+          restore-keys: |
+            watch-state-
+
+      - name: Run
+        env:
+          WATCH_CONFIG: ${{ secrets.WATCH_CONFIG }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python watch.py --state state.json
