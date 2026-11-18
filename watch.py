@@ -40,6 +40,18 @@ HEADERS = {
 EMBED_COLOR = 0x62A8E5
 
 
+def gh_error(message: str) -> None:
+    """GitHub Actions の注釈としてエラーを出す。
+
+    Actions のログ本体は認証が無いと読めないが、注釈は公開 API から読める。
+    設定の取り違えのような「ログを見ないと分からない」失敗を、
+    外から診断できるようにしておく。**秘密の値は絶対に入れない。**
+    """
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        flat = message.replace("\r", " ").replace("\n", " ")
+        print(f"::error::{flat}", flush=True)
+
+
 # ---------- 取得 ----------
 
 def fetch_static_html(url: str, cfg: dict) -> tuple[str, dict]:
@@ -428,17 +440,21 @@ def main() -> int:
     )
     if not raw.strip():
         print("監視対象がありません。WATCH_CONFIG か --config を指定してください。", file=sys.stderr)
+        gh_error("WATCH_CONFIG が空です。監視対象の YAML を設定してください。")
         return 2
 
     webhook = os.environ.get("DISCORD_WEBHOOK_URL", "")
     if not webhook and not args.dry_run:
         print("DISCORD_WEBHOOK_URL が未設定です。", file=sys.stderr)
+        gh_error("DISCORD_WEBHOOK_URL が空です。シークレットを取り違えていないか確認してください。")
         return 2
 
     try:
         config = yaml.safe_load(raw) or {}
     except yaml.YAMLError as exc:
         print(f"WATCH_CONFIG が YAML として読めません: {exc}", file=sys.stderr)
+        # 例外文には設定の断片が入りうるので、注釈には種類だけ出す
+        gh_error(f"WATCH_CONFIG が YAML として読めません（{type(exc).__name__}）。貼り付け時に前の内容が残っていないか確認してください。")
         return 2
 
     # URL をそのまま貼ると文字列として読まれる。実際にあった間違いなので明示する
@@ -453,6 +469,11 @@ def main() -> int:
             )
         print(f"  先頭: {head}", file=sys.stderr)
         print("  期待する形: collections: から始まる YAML", file=sys.stderr)
+        kind = "URL らしきもの" if head.startswith("http") else f"{type(config).__name__} 型"
+        gh_error(
+            f"WATCH_CONFIG が設定 YAML ではありません（{kind}が入っています）。"
+            "collections: から始まる YAML を貼り直してください。"
+        )
         return 2
 
     collections = [
@@ -498,6 +519,7 @@ def main() -> int:
     )
     if checked and len(total_errors) >= checked:
         print("すべての対象に到達できませんでした。", file=sys.stderr)
+        gh_error(f"すべての対象（{checked} 件）に到達できませんでした。")
         return 1
     return 0
 
