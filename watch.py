@@ -55,25 +55,80 @@ def fetch_static_html(url: str, cfg: dict) -> tuple[str, dict]:
     return hashlib.md5(text.encode()).hexdigest(), {"length": len(text)}
 
 
-def fetch_grow_slots(page, url: str, wait_ms: int) -> tuple[str, dict]:
-    """予約枠の空き。JS で描画されるので実ブラウザで読む。"""
-    page.goto(url)
-    page.wait_for_timeout(wait_ms)
-    # 対象の span は非表示で、click() は可視性チェックでタイムアウトする。
-    # DOM 側で直接クリックする
-    page.evaluate(
-        "() => { const s = document.querySelectorAll('span');"
-        " if (s.length > 1) s[1].click(); }"
+# コース選択ボタン。スマホ用(.sp)が先に並んでおり非表示なので、
+# class だけで掴むと見えない方に当たって何も起きない
+CLICK_COURSE_JS = """() => {
+  const btns = Array.from(document.querySelectorAll('a.selbtn'));
+  const target = btns.find(b => b.offsetWidth || b.offsetHeight) || btns[0];
+  if (!target) return false;
+  target.click();
+  return true;
+}"""
+
+CALENDAR_READY_JS = """() => {
+  const t = document.querySelector('table');
+  return !!(t && t.querySelectorAll('td').length);
+}"""
+
+# ○=空き / ×=予約済 / -=営業時間外。
+# 日付は見出し行の th、時刻は各行の先頭セルから取る
+EXTRACT_SLOTS_JS = """() => {
+  const table = document.querySelector('table');
+  if (!table) return null;
+  const tds = table.querySelectorAll('td').length;
+  if (!tds) return null;
+  const rows = Array.from(table.querySelectorAll('tr'));
+  let dates = [];
+  for (const r of rows) {
+    const ths = Array.from(r.querySelectorAll('th'))
+      .map(x => (x.innerText || '').replace(/\\s+/g, ' ').trim());
+    if (ths.filter(x => /\\d/.test(x)).length >= 5) { dates = ths; break; }
+  }
+  const open = [];
+  let time = '';
+  for (const r of rows) {
+    const cells = Array.from(r.children);
+    const head = (cells[0] && (cells[0].innerText || '').trim()) || '';
+    if (/^\\d{1,2}:\\d{2}$/.test(head)) time = head;
+    cells.forEach((c, i) => {
+      if ((c.innerText || '').trim() === '\u25cb') {
+        open.push({ date: dates[i] || '?', time: time });
+      }
+    });
+  }
+  return { open: open, cells: tds };
+}"""
+
+
+def fetch_grow_slots(page, url: str, timeout_ms: int, settle_ms: int) -> tuple[str, dict]:
+    """予約枠の空きを読む。
+
+    2026-11 にサイトのフローが変わり、?page=time を直接開いても
+    「メニューを選択」の画面に着地するようになった。コースを選んで
+    初めてカレンダーが描かれる（実測 6〜12 秒）。
+    旧実装は span[1] をクリックして 5 秒待つだけだったため、
+    カレンダーに到達せず「空き 0 枠」を正常値として記録し続けていた。
+    固定待ちをやめ、描画されるまで待ち、出なければ例外にする
+    （黙って 0 を返すと故障が通知の不在と区別できない）。
+    """
+    page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+    page.wait_for_selector("a.selbtn", state="attached", timeout=timeout_ms)
+    if not page.evaluate(CLICK_COURSE_JS):
+        raise RuntimeError("コース選択ボタンが無い（サイト構成の変更か）")
+    page.wait_for_function(CALENDAR_READY_JS, timeout=timeout_ms)
+    page.wait_for_timeout(settle_ms)
+    data = page.evaluate(EXTRACT_SLOTS_JS)
+    if not data:
+        raise RuntimeError("カレンダーが描画されなかった")
+    slots = sorted(
+        ({"date": o["date"], "time": o["time"]} for o in data["open"]),
+        key=lambda o: (o["date"], o["time"]),
     )
-    page.wait_for_timeout(wait_ms)
-    cells = page.evaluate(
-        "Array.from(document.querySelectorAll('td'))"
-        ".map(td => ({className: td.className, text: td.innerText}))"
-    )
-    slots = [c for c in cells if c.get("className") not in ("empty", "")]
+    # 指紋は空き枠だけから作る。× の並びを混ぜると無関係な変化で鳴る
     return json.dumps(slots, ensure_ascii=False, sort_keys=True), {
         "slot_count": len(slots),
-        "cells": len(cells),
+        "slots": slots,
+        "cells": data["cells"],
     }
 
 
@@ -102,6 +157,58 @@ def notify(webhook: str, message: str, links: list[tuple[str, str]]) -> None:
         ]
     res = requests.post(webhook, json=payload, timeout=20)
     res.raise_for_status()
+
+
+ERROR_STATE_KEY = "__last_error_signature__"
+
+
+def error_signature(errors: list[str]) -> str:
+    """同じ故障で鳴り続けないための指紋。対象名と例外の種類だけで作る。"""
+    parts = []
+    for e in errors:
+        who, _, rest = e.partition(": ")
+        parts.append(f"{who}:{rest.split('(')[0].strip()[:60]}")
+    return " | ".join(sorted(set(parts)))
+
+
+def notify_health(webhook: str, state: dict, errors: list[str], dry: bool) -> None:
+    """監視が壊れたら黙らずに知らせる。
+
+    枠の検出が壊れていた間、ログ上は「変化なし・エラーなし」に見えており、
+    通知が来ないことと空きが無いことが区別できなかった。
+    故障が故障として届かないと、気づけるのは何日も後になる。
+    同じ故障で鳴り続けないよう、指紋が変わったときだけ送る。
+    """
+    sig = error_signature(errors)
+    if sig == state.get(ERROR_STATE_KEY, ""):
+        return
+
+    if sig:
+        names = ", ".join(sorted({e.partition(": ")[0] for e in errors}))
+        message = f"監視が失敗しています（{len(errors)}件）: {names}"
+    else:
+        message = "監視が復旧しました"
+
+    if dry:
+        print(f"  [dry-run] 健全性通知: {message}")
+    else:
+        try:
+            # content はプッシュに出るので短く。詳細は埋め込みへ
+            payload: dict[str, Any] = {"content": message}
+            if errors:
+                payload["embeds"] = [
+                    {
+                        "description": "\n".join(f"- {e}" for e in errors)[:4000],
+                        "color": 0xE57373,
+                    }
+                ]
+            res = requests.post(webhook, json=payload, timeout=20)
+            res.raise_for_status()
+        except Exception as exc:  # noqa: BLE001
+            print(f"  健全性の通知に失敗: {exc}", file=sys.stderr)
+            return
+
+    state[ERROR_STATE_KEY] = sig
 
 
 # ---------- 本体 ----------
@@ -141,12 +248,24 @@ def run_collection(coll: dict, state: dict, webhook: str, dry: bool) -> tuple[in
 
     browser = ctx = page = pw = None
     if adapter == "playwright_grow":
-        from playwright.sync_api import sync_playwright
+        # ブラウザの起動失敗を各 source の try の外で起こすと、例外が
+        # main まで抜けて状態ファイルが一切書かれない。実際に Actions 側で
+        # 28 回連続して状態が前に進まなかった。ここで受け止めて
+        # 「全 source がエラー」として扱う
+        try:
+            from playwright.sync_api import sync_playwright
 
-        pw = sync_playwright().start()
-        browser = pw.chromium.launch()
-        ctx = browser.new_context(locale="ja-JP")
-        page = ctx.new_page()
+            pw = sync_playwright().start()
+            browser = pw.chromium.launch()
+            ctx = browser.new_context(locale="ja-JP", user_agent=USER_AGENT)
+            page = ctx.new_page()
+        except Exception as exc:
+            for src in sources:
+                errors.append(f"{src['label'] or src['url']}: ブラウザを起動できない: {exc}")
+            print(f"[{name}] 確認=0 変化=0 エラー={len(errors)}（ブラウザ起動不可）")
+            for e in errors:
+                print(f"  error: {e}", file=sys.stderr)
+            return 0, errors
 
     changes: list[tuple[str, str, str, bool]] = []  # label, url, message, is_first
     previous: dict[str, Any] = {}
@@ -155,7 +274,12 @@ def run_collection(coll: dict, state: dict, webhook: str, dry: bool) -> tuple[in
             url, label = src["url"], src["label"]
             try:
                 if adapter == "playwright_grow":
-                    fp, meta = fetch_grow_slots(page, url, int(cfg.get("wait_ms", 5000)))
+                    fp, meta = fetch_grow_slots(
+                        page,
+                        url,
+                        int(cfg.get("timeout_ms", 60000)),
+                        int(cfg.get("settle_ms", 800)),
+                    )
                 else:
                     fp, meta = fetch_static_html(url, cfg)
             except Exception as exc:
@@ -277,10 +401,23 @@ def main() -> int:
         total_changes += n
         total_errors += errs
 
+    # 壊れていることは、通知が来ないという形ではなく通知で伝える
+    notify_health(webhook, state, total_errors, args.dry_run)
+
     state_path.parent.mkdir(parents=True, exist_ok=True)
     state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
     print(f"合計: 変化 {total_changes} 件 / エラー {len(total_errors)} 件")
-    return 1 if total_errors and total_changes == 0 and not state else 0
+
+    # 全滅（どこにも到達できない）のときだけ赤くする。
+    # 一部の失敗は Discord 側で伝わるので、実行自体は成功扱いにして
+    # 状態キャッシュを前に進める
+    checked = sum(
+        len([x for x in (c.get("sources") or [])]) for c in collections
+    )
+    if checked and len(total_errors) >= checked:
+        print("すべての対象に到達できませんでした。", file=sys.stderr)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":

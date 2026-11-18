@@ -2,8 +2,11 @@ name: Watch
 
 on:
   schedule:
-    - cron: '*/10 * * * *'   # 10 分ごと
-  workflow_dispatch:          # 手動実行
+    # 10 分ごとに頼んでいるが、GitHub の無料スケジュールは大幅に遅延する。
+    # 実測（2026-11-06〜17 の 47 回）では間隔の中央値が 382 分だった。
+    # 速さが要る監視はここに頼らず、常時稼働側で回すこと。
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
 
 # 前の実行が長引いても二重に走らせない
 concurrency:
@@ -13,7 +16,7 @@ concurrency:
 jobs:
   watch:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -33,18 +36,18 @@ jobs:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
 
+      # キャッシュヒットで導入を飛ばすと、一度不完全なキャッシュが
+      # 保存された時点から毎回ブラウザ起動に失敗し続ける（キャッシュキーは
+      # 固定なので自然復旧しない）。install は入っていれば数秒で終わるので
+      # 常に走らせ、OS 側の依存は毎回入れる（ランナーは毎回新しい）。
       - name: Install Chromium
-        if: steps.pw-cache.outputs.cache-hit != 'true'
-        run: python -m playwright install chromium --with-deps
+        run: |
+          python -m playwright install chromium
+          python -m playwright install-deps chromium
+          python -c "from playwright.sync_api import sync_playwright; p = sync_playwright().start(); b = p.chromium.launch(); b.close(); p.stop(); print('chromium 起動確認OK')"
 
-      - name: Install Chromium deps
-        if: steps.pw-cache.outputs.cache-hit == 'true'
-        run: python -m playwright install-deps chromium
-
-      # key を固定すると初回以降保存されず、状態が凍結して誤通知が続く。
-      # run_id を入れて毎回保存し、restore-keys で直前を拾う
       - name: Restore state
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: state.json
           key: watch-state-${{ github.run_id }}
@@ -56,3 +59,10 @@ jobs:
           WATCH_CONFIG: ${{ secrets.WATCH_CONFIG }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: python watch.py --state state.json
+
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: watch-state-${{ github.run_id }}
