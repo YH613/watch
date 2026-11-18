@@ -160,6 +160,12 @@ def notify(webhook: str, message: str, links: list[tuple[str, str]]) -> None:
 
 
 ERROR_STATE_KEY = "__last_error_signature__"
+LAST_RUN_KEY = "__last_run_at__"
+GAP_ALERT_KEY = "__last_gap_alert_at__"
+# 10 分間隔の想定。これを大きく超えたら「回っていない」と見なす
+DEFAULT_ALERT_GAP_MINUTES = 60
+# 回っていない間ずっと鳴り続けないための間引き
+GAP_ALERT_COOLDOWN_HOURS = 12
 
 
 def error_signature(errors: list[str]) -> str:
@@ -209,6 +215,72 @@ def notify_health(webhook: str, state: dict, errors: list[str], dry: bool) -> No
             return
 
     state[ERROR_STATE_KEY] = sig
+
+
+def measure_interval(state: dict) -> float | None:
+    """前回実行からの間隔（分）を返し、今回の時刻を記録する。"""
+    now = datetime.now(timezone.utc)
+    prev_raw = state.get(LAST_RUN_KEY)
+    state[LAST_RUN_KEY] = now.isoformat()
+    if not prev_raw:
+        return None
+    try:
+        prev = datetime.fromisoformat(prev_raw)
+    except (TypeError, ValueError):
+        return None
+    return (now - prev).total_seconds() / 60
+
+
+def notify_interval(
+    webhook: str, state: dict, gap_minutes: float | None, limit: float, dry: bool
+) -> None:
+    """実行が止まっていることを知らせる。
+
+    外部 cron から API で起動する構成では、cron サービスが止まったり
+    トークンが期限切れになると「実行自体が起きない」。すると通知も来ないので、
+    空きが無いのと区別がつかない（今回 10 日気づけなかったのと同じ形）。
+    schedule の定期実行が保険で残っているので、そのときに間隔を見て知らせる。
+    """
+    if gap_minutes is None or gap_minutes <= limit:
+        return
+
+    now = datetime.now(timezone.utc)
+    last_raw = state.get(GAP_ALERT_KEY)
+    if last_raw:
+        try:
+            last = datetime.fromisoformat(last_raw)
+            if (now - last).total_seconds() < GAP_ALERT_COOLDOWN_HOURS * 3600:
+                return
+        except (TypeError, ValueError):
+            pass
+
+    message = f"監視が {int(gap_minutes)} 分動いていません（10分間隔の想定）"
+    if dry:
+        print(f"  [dry-run] 間隔の通知: {message}")
+    else:
+        try:
+            res = requests.post(
+                webhook,
+                json={
+                    "content": message,
+                    "embeds": [
+                        {
+                            "description": (
+                                "外部 cron からの起動が止まっている可能性があります。"
+                                "cron サービスの実行履歴と、GitHub トークンの有効期限を"
+                                "確認してください。"
+                            ),
+                            "color": 0xE57373,
+                        }
+                    ],
+                },
+                timeout=20,
+            )
+            res.raise_for_status()
+        except Exception as exc:  # noqa: BLE001
+            print(f"  間隔の通知に失敗: {exc}", file=sys.stderr)
+            return
+    state[GAP_ALERT_KEY] = now.isoformat()
 
 
 # ---------- 本体 ----------
@@ -393,6 +465,9 @@ def main() -> int:
 
     state_path = Path(args.state)
     state = load_state(state_path)
+    gap_minutes = measure_interval(state)
+    if gap_minutes is not None:
+        print(f"前回実行から {gap_minutes:.0f} 分")
     total_changes = 0
     total_errors: list[str] = []
 
@@ -403,6 +478,13 @@ def main() -> int:
 
     # 壊れていることは、通知が来ないという形ではなく通知で伝える
     notify_health(webhook, state, total_errors, args.dry_run)
+    notify_interval(
+        webhook,
+        state,
+        gap_minutes,
+        float(os.environ.get("WATCH_ALERT_GAP_MINUTES", DEFAULT_ALERT_GAP_MINUTES)),
+        args.dry_run,
+    )
 
     state_path.parent.mkdir(parents=True, exist_ok=True)
     state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
