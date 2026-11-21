@@ -352,12 +352,12 @@ async def gather_grow_slots(
 
             spent: list[float] = []
 
-            async def one(url: str) -> None:
+            async def one(url: str, ms: int | None = None) -> None:
                 context = await pool.get()
                 at = time.monotonic()
                 try:
                     results[url] = await fetch_grow_one(
-                        context, url, timeout_ms, settle_ms
+                        context, url, ms or timeout_ms, settle_ms
                     )
                     spent.append(time.monotonic() - at)
                 except Exception as exc:  # noqa: BLE001
@@ -365,12 +365,34 @@ async def gather_grow_slots(
                 finally:
                     await pool.put(context)
 
-            try:
-                await asyncio.wait_for(
-                    asyncio.gather(*(one(u) for u in urls)), timeout=budget
+            started = time.monotonic()
+            # キャッシュが空のままだと、サイトが遅い日は 1 件も完走できず、
+            # 次回に渡すキャッシュも溜まらない（落としかけのファイルは
+            # キャッシュされない）。実測 2026-11-21: 7 件が 7 件とも時間切れ、
+            # 持ち越し 0MB のまま何度やっても同じ。この輪を断つため、
+            # 空のときだけ 1 件目に長い時間を与えて温める。
+            # その 1 件だけで実行が終わってもいい。次回から全件が速くなる
+            if warm_mb < 1 and urls:
+                prime = min(240.0, max(timeout_ms / 1000, budget * 0.5))
+                gh_warning(
+                    f"予約枠: キャッシュが空なので 1 件目に最大 {prime:.0f} 秒かける"
                 )
-            except asyncio.TimeoutError:
-                pass
+                try:
+                    await asyncio.wait_for(
+                        one(urls[0], int(prime * 1000)), timeout=prime + 30
+                    )
+                except asyncio.TimeoutError:
+                    pass
+                urls = urls[1:]
+
+            rest = budget - (time.monotonic() - started)
+            if urls and rest > 5:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*(one(u) for u in urls)), timeout=rest
+                    )
+                except asyncio.TimeoutError:
+                    pass
         finally:
             # キャッシュが効いているかは外から見えないと確かめられない
             gh_warning(
