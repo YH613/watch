@@ -357,6 +357,11 @@ def notify(webhook: str, message: str, links: list[tuple[str, str]]) -> None:
 # 時間内に回りきらなかったとき、次回どこから始めるか。
 # 毎回先頭から始めると、後ろのセラピストが永久に確認されない
 CURSOR_KEY = "__cursor__"
+# 対象ごとの「最後に読めた時刻」。失敗の有無ではなく、これで健全性を見る
+LAST_OK_KEY = "__last_ok__"
+# これだけ読めていなければ、監視に穴が空いていると見なす。
+# 一周が約 23 分なので、4〜5 周ぶん
+DEFAULT_STALE_MINUTES = 120
 ERROR_STATE_KEY = "__last_error_signature__"
 LAST_RUN_KEY = "__last_run_at__"
 GAP_ALERT_KEY = "__last_gap_alert_at__"
@@ -381,34 +386,57 @@ def error_signature(errors: list[str]) -> str:
     return " | ".join(sorted(set(parts)))
 
 
-def notify_health(webhook: str, state: dict, errors: list[str], dry: bool) -> None:
-    """監視が壊れたら黙らずに知らせる。
+def find_stale(state: dict, watched: dict[str, str], limit_minutes: float) -> list[str]:
+    """長く読めていない対象を「ラベル（N分）」の形で返す。
+
+    1 回の時間切れは故障ではない。順番に回しているので、
+    失敗したものは次の周で読み直される。
+    それを失敗として鳴らすと、毎回ちがう名前で鳴り続ける。
+    見るべきは「一定時間ぶん読めていないか」だけ。
+    """
+    now = datetime.now(timezone.utc)
+    last_ok = state.setdefault(LAST_OK_KEY, {})
+    stale = []
+    for url, label in watched.items():
+        # 初めて見る対象は、ここを起点に数える
+        seen = last_ok.setdefault(url, now.isoformat())
+        try:
+            minutes = (now - datetime.fromisoformat(seen)).total_seconds() / 60
+        except (TypeError, ValueError):
+            last_ok[url] = now.isoformat()
+            continue
+        if minutes > limit_minutes:
+            stale.append(f"{label or url}（{int(minutes)}分）")
+    return sorted(stale)
+
+
+def notify_health(webhook: str, state: dict, stale: list[str], dry: bool) -> None:
+    """監視に穴が空いたら黙らずに知らせる。
 
     枠の検出が壊れていた間、ログ上は「変化なし・エラーなし」に見えており、
     通知が来ないことと空きが無いことが区別できなかった。
     故障が故障として届かないと、気づけるのは何日も後になる。
-    同じ故障で鳴り続けないよう、指紋が変わったときだけ送る。
+    同じ状態で鳴り続けないよう、顔ぶれが変わったときだけ送る。
     """
-    sig = error_signature(errors)
+    sig = " | ".join(x.partition("（")[0] for x in stale)
     if sig == state.get(ERROR_STATE_KEY, ""):
         return
 
-    if sig:
-        names = ", ".join(sorted({e.partition(": ")[0] for e in errors}))
-        message = f"監視が失敗しています（{len(errors)}件）: {names}"
+    if stale:
+        message = f"{len(stale)} 件が長く確認できていません"
     else:
         message = "監視が復旧しました"
 
     if dry:
-        print(f"  [dry-run] 健全性通知: {message}")
+        print(f"  [dry-run] 健全性通知: {message} {stale}")
     else:
         try:
             # content はプッシュに出るので短く。詳細は埋め込みへ
             payload: dict[str, Any] = {"content": message}
-            if errors:
+            if stale:
                 payload["embeds"] = [
                     {
-                        "description": "\n".join(f"- {e}" for e in errors)[:4000],
+                        "description": "\n".join(f"- {x}" for x in stale)[:4000],
                         "color": 0xE57373,
                     }
                 ]
@@ -585,6 +613,10 @@ def run_collection(
             errors.append(f"{label or url}: {exc}")
             continue
 
+        # 読めた時刻を残す。1 回の失敗は故障ではないが、
+        # 長く読めていないのは故障
+        state.setdefault(LAST_OK_KEY, {})[url] = datetime.now(timezone.utc).isoformat()
+
         prev = state.get(url)
         first = prev is None
         reason = ""
@@ -746,8 +778,23 @@ def main() -> int:
     if elapsed > budget / 2:
         gh_warning(f"実行に {elapsed:.0f} 秒（予算 {budget:.0f} 秒）: " + " / ".join(timings))
 
-    # 壊れていることは、通知が来ないという形ではなく通知で伝える
-    notify_health(webhook, state, total_errors, args.dry_run)
+    # 1 回の失敗ではなく「長く読めていないこと」を故障として伝える
+    watched: dict[str, str] = {}
+    for coll in collections:
+        for s in coll.get("sources") or []:
+            if isinstance(s, str):
+                watched[s] = ""
+            elif isinstance(s, dict) and s.get("url"):
+                watched[s["url"]] = s.get("label") or ""
+    stale = find_stale(
+        state,
+        watched,
+        float(os.environ.get("WATCH_STALE_MINUTES", DEFAULT_STALE_MINUTES)),
+    )
+    notify_health(webhook, state, stale, args.dry_run)
+    if total_errors:
+        # 失敗そのものは鳴らさないが、外から診断できるよう注釈には残す
+        gh_warning(f"今回の失敗 {len(total_errors)} 件: {error_signature(total_errors)[:400]}")
     notify_interval(
         webhook,
         state,
