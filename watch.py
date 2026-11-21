@@ -286,25 +286,27 @@ async def gather_grow_slots(
     async with async_playwright() as pw:
         browser = await pw.chromium.launch()
         try:
-            limit = asyncio.Semaphore(max(1, concurrency))
+            # 予約サイトは選択状態をサーバー側のセッションで持つので、
+            # 同時に動かすぶんだけコンテキスト（= Cookie）を分ける。
+            # ただし 1 件ごとに作り直してはいけない。キャッシュが毎回空になり、
+            # 1 件 26 秒だったものが 65 秒に落ちて 16 件中 7 件しか回れなかった。
+            # 使い回す本数を同時実行数に合わせ、順番に貸し出す
+            pool: asyncio.Queue = asyncio.Queue()
+            for _ in range(max(1, concurrency)):
+                await pool.put(
+                    await browser.new_context(locale="ja-JP", user_agent=USER_AGENT)
+                )
 
             async def one(url: str) -> None:
-                async with limit:
-                    # 予約サイトは選択状態をサーバー側のセッションで持つ。
-                    # コンテキスト（= Cookie）を共有したまま同時に開くと
-                    # 互いの手順を壊し合い、16 件中 8 件が時間切れになった。
-                    # 1 件ずつ独立したコンテキストで開く
-                    context = await browser.new_context(
-                        locale="ja-JP", user_agent=USER_AGENT
+                context = await pool.get()
+                try:
+                    results[url] = await fetch_grow_one(
+                        context, url, timeout_ms, settle_ms
                     )
-                    try:
-                        results[url] = await fetch_grow_one(
-                            context, url, timeout_ms, settle_ms
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        results[url] = exc
-                    finally:
-                        await context.close()
+                except Exception as exc:  # noqa: BLE001
+                    results[url] = exc
+                finally:
+                    await pool.put(context)
 
             try:
                 await asyncio.wait_for(
