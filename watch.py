@@ -293,9 +293,23 @@ async def gather_grow_slots(
             # 使い回す本数を同時実行数に合わせ、順番に貸し出す
             pool: asyncio.Queue = asyncio.Queue()
             for _ in range(max(1, concurrency)):
-                await pool.put(
-                    await browser.new_context(locale="ja-JP", user_agent=USER_AGENT)
+                context = await browser.new_context(
+                    locale="ja-JP", user_agent=USER_AGENT
                 )
+                # 空き枠は表組みの文字だけで分かる。写真やフォントは
+                # 読む必要がないのに、回線の遅い Actions 上では
+                # 1 件 64 秒の大半を占めてしまう。CSS と JS は
+                # カレンダーの描画に要るので落とさない
+                await context.route(
+                    "**/*",
+                    lambda route: (
+                        route.abort()
+                        if route.request.resource_type
+                        in ("image", "media", "font")
+                        else route.continue_()
+                    ),
+                )
+                await pool.put(context)
 
             async def one(url: str) -> None:
                 context = await pool.get()
