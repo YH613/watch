@@ -54,17 +54,120 @@ def gh_error(message: str) -> None:
 
 # ---------- 取得 ----------
 
+# 15 秒では 15 件中 2 件が時間切れになった。到達できないわけではなく
+# 遅いだけなので、待ち時間を伸ばし、一度だけ取り直す。
+# 時間切れをそのままエラーにすると「監視が失敗しています」が無駄に鳴る
+DEFAULT_TIMEOUT = 30
+
+
+def get_with_retry(url: str, timeout: int) -> Any:
+    """GET する。接続の不調は一度だけ取り直す。"""
+    for attempt in (1, 2):
+        try:
+            res = requests.get(url, timeout=timeout, headers=HEADERS)
+            res.raise_for_status()
+            return res
+        except (requests.Timeout, requests.ConnectionError):
+            if attempt == 2:
+                raise
+
+
+# 出勤表は「今日から7日分」の窓。日付が毎朝ひとつずれるので、
+# 本文ごとハッシュにすると中身が同じでも全ページが毎朝「変化」になる
+SCHEDULE_WRAP_SELECTOR = "div.weekScheduleWrap"
+# 「本日出勤」バッジも日付で出入りするため本文から外す
+TODAY_BADGE_SELECTOR = "span.todayWorkIcon"
+DATE_RE = re.compile(r"\d{1,2}/\d{1,2}")
+STATIC_FP_VERSION = 2
+
+
+def extract_week_schedule(soup: Any) -> dict[str, str]:
+    """出勤表を 日付→状態 の対応に直す。
+
+    位置ではなく日付で突き合わせられるようにしておくと、窓がずれただけの
+    変化と、実際に予定が変わった変化を分けられる。
+    """
+    schedule: dict[str, str] = {}
+    for wrap in soup.select(SCHEDULE_WRAP_SELECTOR):
+        for row in wrap.select("tr"):
+            date = ""
+            for cell in row.find_all(["th", "td"], recursive=False):
+                text = " ".join(cell.get_text(" ").split())
+                if cell.name == "th":
+                    found = DATE_RE.search(text)
+                    date = found.group(0) if found else ""
+                elif date:
+                    schedule[date] = text
+    return schedule
+
+
 def fetch_static_html(url: str, cfg: dict) -> tuple[str, dict]:
-    """ページ本文のハッシュ。script/style は無視する。"""
-    res = requests.get(url, timeout=int(cfg.get("timeout", 15)), headers=HEADERS)
-    res.raise_for_status()
+    """ページ本文のハッシュ。script/style と、日付でずれる部分は外す。
+
+    出勤表と「本日出勤」バッジは本文から切り離して別に持つ。
+    どちらも中身が同じでも日付が変わるだけで文字列が変わるため、
+    本文に混ぜると毎朝、全員分が「更新あり」として鳴ってしまう。
+    """
+    res = get_with_retry(url, int(cfg.get("timeout", DEFAULT_TIMEOUT)))
     if res.encoding and res.encoding.lower() in ("iso-8859-1", "ascii"):
         res.encoding = res.apparent_encoding or "utf-8"
     soup = BeautifulSoup(res.text, "html.parser")
     for tag in soup(["script", "style"]):
         tag.decompose()
+    schedule = extract_week_schedule(soup)
+    for selector in (SCHEDULE_WRAP_SELECTOR, TODAY_BADGE_SELECTOR):
+        for tag in soup.select(selector):
+            tag.decompose()
     text = soup.get_text()
-    return hashlib.md5(text.encode()).hexdigest(), {"length": len(text)}
+    fingerprint = json.dumps(
+        {
+            "v": STATIC_FP_VERSION,
+            "body": hashlib.md5(text.encode()).hexdigest(),
+            "schedule": schedule,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return fingerprint, {"length": len(text), "schedule": schedule}
+
+
+def static_changed(prev: str, now: str) -> tuple[bool, str]:
+    """ページが実質的に変わったかを、変わった中身つきで返す。
+
+    出勤表は「前回と今回の両方に載っている日付」だけで比べる。
+    窓がずれて消えた日・現れた日は変化として扱わない。
+
+    指紋が旧い形式のときは、変化なしとして黙って作り直す。
+    形式を変えた直後に全員分が一斉に鳴るのを避けるため
+    （この取りこぼしは一度きり）。
+    """
+    try:
+        before = json.loads(prev)
+        after = json.loads(now)
+    except (TypeError, ValueError):
+        return False, ""
+    if not isinstance(before, dict) or before.get("v") != STATIC_FP_VERSION:
+        return False, ""
+    if before.get("body") != after.get("body"):
+        return True, "ページの内容が変わりました"
+    old_days = before.get("schedule") or {}
+    new_days = after.get("schedule") or {}
+    diffs = [
+        f"{day} {old_days[day]} → {new_days[day]}"
+        for day in sorted(set(old_days) & set(new_days), key=sort_key_for_day)
+        if old_days[day] != new_days[day]
+    ]
+    if diffs:
+        return True, "出勤が変わりました: " + " / ".join(diffs)
+    return False, ""
+
+
+def sort_key_for_day(day: str) -> tuple[int, int]:
+    month, _, date = day.partition("/")
+    try:
+        return int(month), int(date)
+    except ValueError:
+        return 99, 99
 
 
 # コース選択ボタン。スマホ用(.sp)が先に並んでおり非表示なので、
@@ -372,19 +475,25 @@ def run_collection(coll: dict, state: dict, webhook: str, dry: bool) -> tuple[in
 
             prev = state.get(url)
             first = prev is None
+            reason = ""
             if first:
                 # 予約枠は初回でも空きがあれば知らせる。ページ監視は知らせない
                 hit = adapter == "playwright_grow" and meta.get("slot_count", 0) > 0
-            elif prev != fp:
-                hit = meta.get("slot_count", 1) > 0 if adapter == "playwright_grow" else True
+            elif adapter == "playwright_grow":
+                hit = prev != fp and meta.get("slot_count", 1) > 0
             else:
-                hit = False
+                # 単純な差ではなく「何が変わったか」で判断する。
+                # 出勤表の窓が毎朝ずれるだけで鳴っていた
+                hit, reason = static_changed(prev, fp)
 
             previous[url] = prev
             state[url] = fp
             if hit:
                 msg = format_message(templates, label or "", url, first)
                 if msg:
+                    # 開いても何が変わったか分からない、を避ける
+                    if reason:
+                        msg = f"{msg}\n{reason}"
                     changes.append((label or url, url, msg, first))
     finally:
         for closer in (ctx, browser):
