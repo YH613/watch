@@ -16,6 +16,7 @@ import json
 import os
 import re
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -38,6 +39,18 @@ HEADERS = {
     "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
 }
 EMBED_COLOR = 0x62A8E5
+
+
+# 1 回の実行に使ってよい時間。Actions 側の timeout-minutes より十分短くする。
+# 上限で殺されると、状態を書く前に終わるため進捗が丸ごと消える
+DEFAULT_RUN_BUDGET_SECONDS = 420
+
+
+def gh_warning(message: str) -> None:
+    """GitHub Actions の注釈として警告を出す。読み方は gh_error と同じ。"""
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        flat = message.replace("\r", " ").replace("\n", " ")
+        print(f"::warning::{flat}", flush=True)
 
 
 def gh_error(message: str) -> None:
@@ -284,11 +297,17 @@ GAP_ALERT_COOLDOWN_HOURS = 12
 
 
 def error_signature(errors: list[str]) -> str:
-    """同じ故障で鳴り続けないための指紋。対象名と例外の種類だけで作る。"""
+    """同じ故障で鳴り続けないための指紋。対象名と例外の種類だけで作る。
+
+    件数や秒数は実行ごとに揺れる。そのまま指紋に入れると
+    「時間切れで 13 件」「12 件」が別の故障と見なされ、
+    同じ不調で鳴り続けてしまうので、数字は伏せる。
+    """
     parts = []
     for e in errors:
         who, _, rest = e.partition(": ")
-        parts.append(f"{who}:{rest.split('(')[0].strip()[:60]}")
+        kind = re.sub(r"\d+", "N", rest.split("(")[0].strip())[:60]
+        parts.append(f"{who}:{kind}")
     return " | ".join(sorted(set(parts)))
 
 
@@ -413,7 +432,14 @@ def load_state(path: Path) -> dict:
         return {}
 
 
-def run_collection(coll: dict, state: dict, webhook: str, dry: bool) -> tuple[int, list[str]]:
+def run_collection(
+    coll: dict,
+    state: dict,
+    webhook: str,
+    dry: bool,
+    deadline: float,
+    save_state: Any,
+) -> tuple[int, list[str]]:
     name = coll.get("name", "(無名)")
     adapter = coll.get("adapter", "static_html")
     cfg = coll.get("adapter_config") or {}
@@ -456,9 +482,18 @@ def run_collection(coll: dict, state: dict, webhook: str, dry: bool) -> tuple[in
 
     changes: list[tuple[str, str, str, bool]] = []  # label, url, message, is_first
     previous: dict[str, Any] = {}
+    checked = 0
     try:
-        for src in sources:
+        for index, src in enumerate(sources):
             url, label = src["url"], src["label"]
+            if time.monotonic() > deadline:
+                # 途中で殺されるより、自分で止まって状態を残す方がよい
+                rest = len(sources) - index
+                errors.append(
+                    f"{name}: 時間切れで {rest} 件を確認できませんでした"
+                )
+                break
+            checked += 1
             try:
                 if adapter == "playwright_grow":
                     fp, meta = fetch_grow_slots(
@@ -488,6 +523,10 @@ def run_collection(coll: dict, state: dict, webhook: str, dry: bool) -> tuple[in
 
             previous[url] = prev
             state[url] = fp
+            # 1 件ごとに書き出す。実行が途中で殺されても進捗が消えないように。
+            # 以前は最後にまとめて書いていたため、上限で殺されるたびに
+            # 状態が巻き戻り、同じ通知が 10 分おきに繰り返されていた
+            save_state()
             if hit:
                 msg = format_message(templates, label or "", url, first)
                 if msg:
@@ -506,7 +545,7 @@ def run_collection(coll: dict, state: dict, webhook: str, dry: bool) -> tuple[in
         except Exception:
             pass
 
-    print(f"[{name}] 確認={len(sources)} 変化={len(changes)} エラー={len(errors)}")
+    print(f"[{name}] 確認={checked}/{len(sources)} 変化={len(changes)} エラー={len(errors)}")
     for e in errors:
         print(f"  error: {e}", file=sys.stderr)
 
@@ -595,16 +634,40 @@ def main() -> int:
 
     state_path = Path(args.state)
     state = load_state(state_path)
+
+    def save_state() -> None:
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+
+    budget = float(os.environ.get("WATCH_RUN_BUDGET_SECONDS", DEFAULT_RUN_BUDGET_SECONDS))
+    started = time.monotonic()
+    deadline = started + budget
+
     gap_minutes = measure_interval(state)
     if gap_minutes is not None:
         print(f"前回実行から {gap_minutes:.0f} 分")
     total_changes = 0
     total_errors: list[str] = []
 
-    for coll in collections:
-        n, errs = run_collection(coll, state, webhook, args.dry_run)
+    timings: list[str] = []
+    for position, coll in enumerate(collections):
+        at = time.monotonic()
+        # 先頭のコレクションが予算を使い切ると、後ろ（予約枠）に一度も
+        # 届かなくなる。残り時間を残りのコレクション数で割って分け合う。
+        # 早く終わったぶんは自然と後ろに回る
+        share = max(0.0, deadline - at) / max(1, len(collections) - position)
+        n, errs = run_collection(
+            coll, state, webhook, args.dry_run, at + share, save_state
+        )
+        timings.append(f"{coll.get('name', '(無名)')} {time.monotonic() - at:.0f}秒")
         total_changes += n
         total_errors += errs
+
+    elapsed = time.monotonic() - started
+    # どこに時間を使っているかはログを見ないと分からないが、
+    # ログは認証が無いと読めない。遅いときだけ注釈に出しておく
+    if elapsed > budget / 2:
+        gh_warning(f"実行に {elapsed:.0f} 秒（予算 {budget:.0f} 秒）: " + " / ".join(timings))
 
     # 壊れていることは、通知が来ないという形ではなく通知で伝える
     notify_health(webhook, state, total_errors, args.dry_run)
@@ -616,9 +679,8 @@ def main() -> int:
         args.dry_run,
     )
 
-    state_path.parent.mkdir(parents=True, exist_ok=True)
-    state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
-    print(f"合計: 変化 {total_changes} 件 / エラー {len(total_errors)} 件")
+    save_state()
+    print(f"合計: 変化 {total_changes} 件 / エラー {len(total_errors)} 件 / {elapsed:.0f} 秒")
 
     # 全滅（どこにも到達できない）のときだけ赤くする。
     # 一部の失敗は Discord 側で伝わるので、実行自体は成功扱いにして
