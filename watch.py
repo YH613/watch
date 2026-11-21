@@ -195,6 +195,20 @@ CLICK_COURSE_JS = """() => {
   return true;
 }"""
 
+# 失敗したとき、何本取れて何KB届いたかを見る。
+# 「遅い」のか「応答が止まっている」のか「JS が足りず画面が死んだ」のかは
+# 外から区別できないと直せない
+DIAGNOSE_JS = """() => {
+  const r = performance.getEntriesByType('resource')
+    .filter(x => x.name.includes('/_next/static/'));
+  return {
+    done: r.length,
+    kb: Math.round(r.reduce((s, x) => s + (x.transferSize || 0), 0) / 1024),
+    body: ((document.body && document.body.innerText) || '')
+      .replace(/\\s+/g, ' ').trim().slice(0, 40)
+  };
+}"""
+
 CALENDAR_READY_JS = """() => {
   const t = document.querySelector('table');
   return !!(t && t.querySelectorAll('td').length);
@@ -290,19 +304,49 @@ async def fetch_grow_one(context: Any, url: str, timeout_ms: int, settle_ms: int
     固定待ちをやめ、描画されるまで待ち、出なければ例外にする
     （黙って 0 を返すと故障が通知の不在と区別できない）。
     """
-    page = await context.new_page()
-    try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-        await page.wait_for_selector("a.selbtn", state="attached", timeout=timeout_ms)
-        if not await page.evaluate(CLICK_COURSE_JS):
-            raise RuntimeError("コース選択ボタンが無い（サイト構成の変更か）")
-        await page.wait_for_function(CALENDAR_READY_JS, timeout=timeout_ms)
-        await page.wait_for_timeout(settle_ms)
-        data = await page.evaluate(EXTRACT_SLOTS_JS)
-    finally:
-        await page.close()
+    # サイトは応答の途中で止まることがある（本体が来ないまま終わらない）。
+    # そうなると JS が足りずに画面が死に、待ち時間を伸ばしても意味が無い。
+    # つなぎ直せば通ることがあるので、一度だけ取り直す
+    last: Exception | None = None
+    for attempt in (1, 2):
+        page = await context.new_page()
+        asked = 0
+
+        def count(_: Any) -> None:
+            nonlocal asked
+            asked += 1
+
+        page.on("request", count)
+        data = None
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            await page.wait_for_selector(
+                "a.selbtn", state="attached", timeout=timeout_ms
+            )
+            if not await page.evaluate(CLICK_COURSE_JS):
+                raise RuntimeError("コース選択ボタンが無い（サイト構成の変更か）")
+            await page.wait_for_function(CALENDAR_READY_JS, timeout=timeout_ms)
+            await page.wait_for_timeout(settle_ms)
+            data = await page.evaluate(EXTRACT_SLOTS_JS)
+        except Exception as exc:  # noqa: BLE001
+            got: dict = {}
+            try:
+                got = await page.evaluate(DIAGNOSE_JS)
+            except Exception:  # noqa: BLE001
+                pass
+            kind = type(exc).__name__
+            last = RuntimeError(
+                f"{kind} 静的{got.get('done', '?')}/{asked}本 "
+                f"{got.get('kb', '?')}KB 画面=[{got.get('body', '')}] {attempt}回目"
+            )
+        finally:
+            await page.close()
+        if data:
+            break
+        if attempt == 2:
+            raise last or RuntimeError("カレンダーが描画されなかった")
     if not data:
-        raise RuntimeError("カレンダーが描画されなかった")
+        raise last or RuntimeError("カレンダーが描画されなかった")
     slots = sorted(
         ({"date": o["date"], "time": o["time"]} for o in data["open"]),
         key=lambda o: (o["date"], o["time"]),
@@ -885,7 +929,9 @@ def main() -> int:
     notify_health(webhook, state, stale, args.dry_run)
     if total_errors:
         # 失敗そのものは鳴らさないが、外から診断できるよう注釈には残す
-        gh_warning(f"今回の失敗 {len(total_errors)} 件: {error_signature(total_errors)[:400]}")
+        gh_warning(f"今回の失敗 {len(total_errors)} 件: {error_signature(total_errors)[:300]}")
+        # 署名は数字を伏せるので、原因を見るには生のまま 1 件要る
+        gh_warning(f"失敗の内訳（1 件目）: {total_errors[0][:300]}")
     notify_interval(
         webhook,
         state,
