@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -235,6 +236,48 @@ EXTRACT_SLOTS_JS = """() => {
 # 代わりに、時間内に回りきらなかったぶんは次回の先頭から続ける
 GROW_CONCURRENCY = 1
 
+# ブラウザのプロファイル置き場。ここに Chromium の HTTP キャッシュが残る。
+# 予約ページは 1 回開くのに 28 ファイル・2.9MB を取りに行くので、実行ごとに
+# 空から始めると、サイトが遅い日は 1 件目だけで上限を使い切る（2026-11-21 に
+# 850KB の JS が 11KB/秒まで落ち、7 件が 7 件とも時間切れになった）。
+# Actions 側で actions/cache に出し入れし、実行間で持ち越す。
+# JS はファイル名に内容のハッシュが付いていて 1 年キャッシュ可なので、
+# サイトが更新されれば名前ごと変わる。古いものを掴む心配は無い
+DEFAULT_PROFILE_DIR = ".browser-profile"
+
+
+def dir_size_mb(path: Path) -> float:
+    """持ち越せたキャッシュの量。0 なら実行間の受け渡しが効いていない。"""
+    total = 0
+    for f in path.rglob("*"):
+        try:
+            if f.is_file():
+                total += f.stat().st_size
+        except OSError:
+            pass
+    return total / 1024 / 1024
+
+
+async def open_grow_browser(pw: Any, profile_dir: Path) -> tuple[Any, Any]:
+    """プロファイルを使い回してブラウザを開く。壊れていたら捨てて作り直す。"""
+    for attempt in (1, 2):
+        try:
+            context = await pw.chromium.launch_persistent_context(
+                str(profile_dir),
+                locale="ja-JP",
+                user_agent=USER_AGENT,
+                args=["--disk-cache-size=67108864"],
+            )
+            return context, context.browser
+        except Exception:
+            if attempt == 2:
+                raise
+            # 壊れたプロファイルが保存されると、キャッシュから戻される限り
+            # 毎回同じ失敗を繰り返す（自然復旧しない）。捨ててやり直す
+            shutil.rmtree(profile_dir, ignore_errors=True)
+            gh_warning("ブラウザのプロファイルが開けないので作り直しました")
+    raise RuntimeError("到達しない")
+
 
 async def fetch_grow_one(context: Any, url: str, timeout_ms: int, settle_ms: int) -> tuple[str, dict]:
     """予約枠の空きを 1 件読む。
@@ -283,26 +326,40 @@ async def gather_grow_slots(
     from playwright.async_api import async_playwright
 
     results: dict[str, Any] = {}
+    profile_dir = Path(
+        os.environ.get("WATCH_BROWSER_PROFILE", DEFAULT_PROFILE_DIR)
+    )
+    warm_mb = dir_size_mb(profile_dir)
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch()
+        kept, browser = await open_grow_browser(pw, profile_dir)
+        extra: list[Any] = []
         try:
             # 予約サイトは選択状態をサーバー側のセッションで持つので、
             # 同時に動かすぶんだけコンテキスト（= Cookie）を分ける。
             # ただし 1 件ごとに作り直してはいけない。キャッシュが毎回空になり、
             # 1 件 26 秒だったものが 65 秒に落ちて 16 件中 7 件しか回れなかった。
-            # 使い回す本数を同時実行数に合わせ、順番に貸し出す
+            # 使い回す本数を同時実行数に合わせ、順番に貸し出す。
+            # 1 本目はディスクに残るプロファイル。2 本目以降は使い捨てなので
+            # キャッシュを共有せず、同時実行を増やすほど通信は増える
             pool: asyncio.Queue = asyncio.Queue()
-            for _ in range(max(1, concurrency)):
-                await pool.put(
-                    await browser.new_context(locale="ja-JP", user_agent=USER_AGENT)
+            await pool.put(kept)
+            for _ in range(max(1, concurrency) - 1):
+                context = await browser.new_context(
+                    locale="ja-JP", user_agent=USER_AGENT
                 )
+                extra.append(context)
+                await pool.put(context)
+
+            spent: list[float] = []
 
             async def one(url: str) -> None:
                 context = await pool.get()
+                at = time.monotonic()
                 try:
                     results[url] = await fetch_grow_one(
                         context, url, timeout_ms, settle_ms
                     )
+                    spent.append(time.monotonic() - at)
                 except Exception as exc:  # noqa: BLE001
                     results[url] = exc
                 finally:
@@ -315,7 +372,19 @@ async def gather_grow_slots(
             except asyncio.TimeoutError:
                 pass
         finally:
-            await browser.close()
+            # キャッシュが効いているかは外から見えないと確かめられない
+            gh_warning(
+                f"予約枠: 持ち越したキャッシュ {warm_mb:.0f}MB / "
+                f"読めた {len(spent)} 件 / "
+                f"1 件あたり {sum(spent) / len(spent):.0f} 秒"
+                if spent
+                else f"予約枠: 持ち越したキャッシュ {warm_mb:.0f}MB / 1 件も読めず"
+            )
+            for context in extra:
+                await context.close()
+            # close() でキャッシュの索引が書き出される。
+            # 待たずに殺すと、せっかく落としたものが次回に効かない
+            await kept.close()
     return results
 
 

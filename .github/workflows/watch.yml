@@ -46,6 +46,28 @@ jobs:
           python -m playwright install-deps chromium
           python -c "from playwright.sync_api import sync_playwright; p = sync_playwright().start(); b = p.chromium.launch(); b.close(); p.stop(); print('chromium 起動確認OK')"
 
+      # 予約ページは 1 回開くのに 28 ファイル・2.9MB ある。実行ごとに空から
+      # 始めると、サイトが遅い日は 1 件目だけで上限を使い切る。ブラウザの
+      # キャッシュを実行間で持ち越す。JS はファイル名に内容のハッシュが
+      # 付いているので、古いものを掴む心配は無い。
+      # 鍵に「時」を入れて 1 時間に 1 回だけ保存する。毎回（10 分おきに）
+      # 保存すると数MB を日に 144 回積み、上限 10GB を食って状態の
+      # キャッシュまで押し出す。逆に 1 日 1 回だと、サイトが遅い日に
+      # 中途半端なキャッシュを掴んだまま 1 日固定されてしまう
+      - name: この時間の鍵
+        id: today
+        run: echo "key=$(date -u +%Y%m%d%H)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache browser profile
+        uses: actions/cache@v4
+        with:
+          path: |
+            .browser-profile/Default/Cache
+            .browser-profile/Default/Code Cache
+          key: watch-profile-${{ runner.os }}-${{ steps.today.outputs.key }}
+          restore-keys: |
+            watch-profile-${{ runner.os }}-
+
       - name: Restore state
         uses: actions/cache/restore@v4
         with:
