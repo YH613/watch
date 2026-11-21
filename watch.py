@@ -272,6 +272,18 @@ def dir_size_mb(path: Path) -> float:
     return total / 1024 / 1024
 
 
+def probe_plain(url: str) -> str:
+    """ブラウザを通さず 1 回だけ取る。403 の出どころを切り分けるため。"""
+    try:
+        res = requests.get(url, timeout=20, headers=HEADERS, allow_redirects=True)
+        return (
+            f"{res.status_code} / server={res.headers.get('server', '?')} "
+            f"/ {len(res.content)}B"
+        )
+    except Exception as exc:  # noqa: BLE001
+        return f"取れず {type(exc).__name__}"
+
+
 async def open_grow_browser(pw: Any, profile_dir: Path) -> tuple[Any, Any]:
     """プロファイルを使い回してブラウザを開く。壊れていたら捨てて作り直す。"""
     for attempt in (1, 2):
@@ -317,6 +329,13 @@ async def fetch_grow_one(context: Any, url: str, timeout_ms: int, settle_ms: int
             asked += 1
 
         page.on("request", count)
+        status: list[int] = []
+
+        def note(res: Any) -> None:
+            if res.request.resource_type == "document":
+                status.append(res.status)
+
+        page.on("response", note)
         data = None
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
@@ -336,7 +355,8 @@ async def fetch_grow_one(context: Any, url: str, timeout_ms: int, settle_ms: int
                 pass
             kind = type(exc).__name__
             last = RuntimeError(
-                f"{kind} 静的{got.get('done', '?')}/{asked}本 "
+                f"{kind} 文書={status[0] if status else '?'} "
+                f"静的{got.get('done', '?')}/{asked}本 "
                 f"{got.get('kb', '?')}KB 画面=[{got.get('body', '')}] {attempt}回目"
             )
         finally:
@@ -373,6 +393,7 @@ async def gather_grow_slots(
     profile_dir = Path(
         os.environ.get("WATCH_BROWSER_PROFILE", DEFAULT_PROFILE_DIR)
     )
+    urls_given = list(urls)
     warm_mb = dir_size_mb(profile_dir)
     async with async_playwright() as pw:
         kept, browser = await open_grow_browser(pw, profile_dir)
@@ -438,6 +459,12 @@ async def gather_grow_slots(
                 except asyncio.TimeoutError:
                     pass
         finally:
+            # 1 件も読めないときは、ブラウザのせいか回線（IP）のせいかを分ける。
+            # 素の取得も 403 なら、ブラウザの作りを直しても無駄
+            if not spent and urls_given:
+                gh_warning("予約枠の素の取得: " + await asyncio.to_thread(
+                    probe_plain, urls_given[0]))
+
             # キャッシュが効いているかは外から見えないと確かめられない
             gh_warning(
                 f"予約枠: 持ち越したキャッシュ {warm_mb:.0f}MB / "
