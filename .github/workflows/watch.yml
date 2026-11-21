@@ -80,6 +80,11 @@ jobs:
         env:
           WATCH_CONFIG: ${{ secrets.WATCH_CONFIG }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          # 予約サイトはここ（データセンターの IP）を 403 で弾く。
+          # ブラウザの作りではなく回線で弾かれているので、クラウドからは
+          # 通せない。予約枠は Mac の launchd から回している
+          # （com.watchscope.grow / 住宅の回線）
+          WATCH_SKIP: grow-reservations
         run: python watch.py --state state.json
 
       - name: Save state

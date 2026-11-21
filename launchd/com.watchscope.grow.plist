@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.watchscope.grow</string>
+
+    <!-- Webhook は run-grow.sh が ~/.watchscope/.env から読む。ここには書かない -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/zsh</string>
+        <string>/Users/hoshikawayuuya/.watchscope/run-grow.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/hoshikawayuuya/daily-todo/watchscope-cloud</string>
+
+    <!-- 10 分ごと。JST 7 時台のスキップは collections.yaml 側 -->
+    <key>StartInterval</key>
+    <integer>600</integer>
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/hoshikawayuuya/.watchscope/grow.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/hoshikawayuuya/.watchscope/grow.err</string>
+</dict>
+</plist>

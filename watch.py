@@ -625,6 +625,28 @@ def measure_interval(state: dict) -> float | None:
     return (now - prev).total_seconds() / 60
 
 
+def forgive_downtime(state: dict, gap_minutes: float | None, cycle: float) -> float:
+    """止まっていた時間を「読めていない時間」から差し引く。
+
+    Mac の launchd から回すぶんは、本体が寝ている間は実行自体が起きない。
+    その時間を数えると、朝いちで必ず「長く確認できていません」が鳴る。
+    止まっていたのは監視の穴ではあるが、対象が読めない故障ではないので、
+    鳴らす対象から外す（鳴りすぎる監視は無視されるようになる）。
+    """
+    if not gap_minutes or gap_minutes <= cycle * 2:
+        return 0.0
+    asleep = gap_minutes - cycle
+    now = datetime.now(timezone.utc)
+    last_ok = state.get(LAST_OK_KEY) or {}
+    for url, seen in list(last_ok.items()):
+        try:
+            moved = datetime.fromisoformat(seen) + timedelta(minutes=asleep)
+        except (TypeError, ValueError):
+            continue
+        last_ok[url] = min(moved, now).isoformat()
+    return asleep
+
+
 def notify_interval(
     webhook: str, state: dict, gap_minutes: float | None, limit: float, dry: bool
 ) -> None:
@@ -903,6 +925,18 @@ def main() -> int:
     if args.collection:
         collections = [c for c in collections if c.get("name") == args.collection]
 
+    # 置き場所を分けるため。予約サイトはデータセンターの IP を 403 で弾くので
+    # （2026-11-21、素の取得でも 403 / server=awselb/2.0）、クラウドでは外し、
+    # 住宅の回線にある Mac から回す。健全性の判定もここで外れた対象は見ない
+    skip = {
+        x.strip()
+        for x in os.environ.get("WATCH_SKIP", "").split(",")
+        if x.strip()
+    }
+    if skip:
+        collections = [c for c in collections if c.get("name") not in skip]
+        print(f"除外: {'/'.join(sorted(skip))}")
+
     state_path = Path(args.state)
     state = load_state(state_path)
 
@@ -917,6 +951,13 @@ def main() -> int:
     gap_minutes = measure_interval(state)
     if gap_minutes is not None:
         print(f"前回実行から {gap_minutes:.0f} 分")
+    asleep = forgive_downtime(
+        state,
+        gap_minutes,
+        float(os.environ.get("WATCH_CYCLE_MINUTES", 10)),
+    )
+    if asleep:
+        print(f"止まっていた {asleep:.0f} 分は未読時間に数えない")
     total_changes = 0
     total_errors: list[str] = []
 
