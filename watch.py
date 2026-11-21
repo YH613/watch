@@ -11,6 +11,7 @@ actions/cache で前後に受け渡す。
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
 import json
 import os
@@ -43,7 +44,7 @@ EMBED_COLOR = 0x62A8E5
 
 # 1 回の実行に使ってよい時間。Actions 側の timeout-minutes より十分短くする。
 # 上限で殺されると、状態を書く前に終わるため進捗が丸ごと消える
-DEFAULT_RUN_BUDGET_SECONDS = 420
+DEFAULT_RUN_BUDGET_SECONDS = 480
 
 
 def gh_warning(message: str) -> None:
@@ -228,8 +229,15 @@ EXTRACT_SLOTS_JS = """() => {
 }"""
 
 
-def fetch_grow_slots(page, url: str, timeout_ms: int, settle_ms: int) -> tuple[str, dict]:
-    """予約枠の空きを読む。
+# 予約サイトは同時アクセスを捌けない。コンテキスト（Cookie）を分けても、
+# 同時 3 件で 16 件すべてが時間切れになった（goto すら返らない）。
+# 速くするために並べるのは諦め、1 件ずつ順に回す。
+# 代わりに、時間内に回りきらなかったぶんは次回の先頭から続ける
+GROW_CONCURRENCY = 1
+
+
+async def fetch_grow_one(context: Any, url: str, timeout_ms: int, settle_ms: int) -> tuple[str, dict]:
+    """予約枠の空きを 1 件読む。
 
     2026-11 にサイトのフローが変わり、?page=time を直接開いても
     「メニューを選択」の画面に着地するようになった。コースを選んで
@@ -239,13 +247,17 @@ def fetch_grow_slots(page, url: str, timeout_ms: int, settle_ms: int) -> tuple[s
     固定待ちをやめ、描画されるまで待ち、出なければ例外にする
     （黙って 0 を返すと故障が通知の不在と区別できない）。
     """
-    page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
-    page.wait_for_selector("a.selbtn", state="attached", timeout=timeout_ms)
-    if not page.evaluate(CLICK_COURSE_JS):
-        raise RuntimeError("コース選択ボタンが無い（サイト構成の変更か）")
-    page.wait_for_function(CALENDAR_READY_JS, timeout=timeout_ms)
-    page.wait_for_timeout(settle_ms)
-    data = page.evaluate(EXTRACT_SLOTS_JS)
+    page = await context.new_page()
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+        await page.wait_for_selector("a.selbtn", state="attached", timeout=timeout_ms)
+        if not await page.evaluate(CLICK_COURSE_JS):
+            raise RuntimeError("コース選択ボタンが無い（サイト構成の変更か）")
+        await page.wait_for_function(CALENDAR_READY_JS, timeout=timeout_ms)
+        await page.wait_for_timeout(settle_ms)
+        data = await page.evaluate(EXTRACT_SLOTS_JS)
+    finally:
+        await page.close()
     if not data:
         raise RuntimeError("カレンダーが描画されなかった")
     slots = sorted(
@@ -258,6 +270,59 @@ def fetch_grow_slots(page, url: str, timeout_ms: int, settle_ms: int) -> tuple[s
         "slots": slots,
         "cells": data["cells"],
     }
+
+
+async def gather_grow_slots(
+    urls: list[str], timeout_ms: int, settle_ms: int, concurrency: int, budget: float
+) -> dict[str, Any]:
+    """URL ごとに結果か例外を入れた対応表を返す。
+
+    予算を超えたら、そこまでに取れたぶんだけを返す。
+    全部そろうまで粘って実行ごと殺されると、状態が一切進まない。
+    """
+    from playwright.async_api import async_playwright
+
+    results: dict[str, Any] = {}
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        try:
+            limit = asyncio.Semaphore(max(1, concurrency))
+
+            async def one(url: str) -> None:
+                async with limit:
+                    # 予約サイトは選択状態をサーバー側のセッションで持つ。
+                    # コンテキスト（= Cookie）を共有したまま同時に開くと
+                    # 互いの手順を壊し合い、16 件中 8 件が時間切れになった。
+                    # 1 件ずつ独立したコンテキストで開く
+                    context = await browser.new_context(
+                        locale="ja-JP", user_agent=USER_AGENT
+                    )
+                    try:
+                        results[url] = await fetch_grow_one(
+                            context, url, timeout_ms, settle_ms
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        results[url] = exc
+                    finally:
+                        await context.close()
+
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*(one(u) for u in urls)), timeout=budget
+                )
+            except asyncio.TimeoutError:
+                pass
+        finally:
+            await browser.close()
+    return results
+
+
+def fetch_grow_slots(
+    urls: list[str], timeout_ms: int, settle_ms: int, concurrency: int, budget: float
+) -> dict[str, Any]:
+    return asyncio.run(
+        gather_grow_slots(urls, timeout_ms, settle_ms, concurrency, budget)
+    )
 
 
 # ---------- 通知 ----------
@@ -287,6 +352,9 @@ def notify(webhook: str, message: str, links: list[tuple[str, str]]) -> None:
     res.raise_for_status()
 
 
+# 時間内に回りきらなかったとき、次回どこから始めるか。
+# 毎回先頭から始めると、後ろのセラピストが永久に確認されない
+CURSOR_KEY = "__cursor__"
 ERROR_STATE_KEY = "__last_error_signature__"
 LAST_RUN_KEY = "__last_run_at__"
 GAP_ALERT_KEY = "__last_gap_alert_at__"
@@ -459,23 +527,29 @@ def run_collection(
         elif isinstance(s, dict) and s.get("url"):
             sources.append({"url": s["url"], "label": s.get("label")})
 
-    browser = ctx = page = pw = None
+    # 前回の続きから回す。1 周したら先頭に戻る
+    cursors = state.setdefault(CURSOR_KEY, {})
+    start = int(cursors.get(name, 0)) % len(sources) if sources else 0
+    sources = sources[start:] + sources[:start]
+
+    grow: dict[str, Any] = {}
     if adapter == "playwright_grow":
         # ブラウザの起動失敗を各 source の try の外で起こすと、例外が
         # main まで抜けて状態ファイルが一切書かれない。実際に Actions 側で
         # 28 回連続して状態が前に進まなかった。ここで受け止めて
         # 「全 source がエラー」として扱う
         try:
-            from playwright.sync_api import sync_playwright
-
-            pw = sync_playwright().start()
-            browser = pw.chromium.launch()
-            ctx = browser.new_context(locale="ja-JP", user_agent=USER_AGENT)
-            page = ctx.new_page()
+            grow = fetch_grow_slots(
+                [s["url"] for s in sources],
+                int(cfg.get("timeout_ms", 60000)),
+                int(cfg.get("settle_ms", 800)),
+                int(cfg.get("concurrency", GROW_CONCURRENCY)),
+                max(5.0, deadline - time.monotonic()),
+            )
         except Exception as exc:
-            for src in sources:
-                errors.append(f"{src['label'] or src['url']}: ブラウザを起動できない: {exc}")
-            print(f"[{name}] 確認=0 変化=0 エラー={len(errors)}（ブラウザ起動不可）")
+            for s in sources:
+                errors.append(f"{s['label'] or s['url']}: ブラウザを起動できない: {exc}")
+            print(f"[{name}] 確認=0/{len(sources)} 変化=0 エラー={len(errors)}（ブラウザ起動不可）")
             for e in errors:
                 print(f"  error: {e}", file=sys.stderr)
             return 0, errors
@@ -483,69 +557,70 @@ def run_collection(
     changes: list[tuple[str, str, str, bool]] = []  # label, url, message, is_first
     previous: dict[str, Any] = {}
     checked = 0
-    try:
-        for index, src in enumerate(sources):
-            url, label = src["url"], src["label"]
-            if time.monotonic() > deadline:
-                # 途中で殺されるより、自分で止まって状態を残す方がよい
-                rest = len(sources) - index
-                errors.append(
-                    f"{name}: 時間切れで {rest} 件を確認できませんでした"
-                )
-                break
-            checked += 1
-            try:
-                if adapter == "playwright_grow":
-                    fp, meta = fetch_grow_slots(
-                        page,
-                        url,
-                        int(cfg.get("timeout_ms", 60000)),
-                        int(cfg.get("settle_ms", 800)),
-                    )
-                else:
-                    fp, meta = fetch_static_html(url, cfg)
-            except Exception as exc:
-                errors.append(f"{label or url}: {exc}")
-                continue
-
-            prev = state.get(url)
-            first = prev is None
-            reason = ""
-            if first:
-                # 予約枠は初回でも空きがあれば知らせる。ページ監視は知らせない
-                hit = adapter == "playwright_grow" and meta.get("slot_count", 0) > 0
-            elif adapter == "playwright_grow":
-                hit = prev != fp and meta.get("slot_count", 1) > 0
-            else:
-                # 単純な差ではなく「何が変わったか」で判断する。
-                # 出勤表の窓が毎朝ずれるだけで鳴っていた
-                hit, reason = static_changed(prev, fp)
-
-            previous[url] = prev
-            state[url] = fp
-            # 1 件ごとに書き出す。実行が途中で殺されても進捗が消えないように。
-            # 以前は最後にまとめて書いていたため、上限で殺されるたびに
-            # 状態が巻き戻り、同じ通知が 10 分おきに繰り返されていた
-            save_state()
-            if hit:
-                msg = format_message(templates, label or "", url, first)
-                if msg:
-                    # 開いても何が変わったか分からない、を避ける
-                    if reason:
-                        msg = f"{msg}\n{reason}"
-                    changes.append((label or url, url, msg, first))
-    finally:
-        for closer in (ctx, browser):
-            try:
-                closer and closer.close()
-            except Exception:
-                pass
+    for src in sources:
+        url, label = src["url"], src["label"]
+        # 予約枠は取得済みなので期限を見ない（見ると全部捨てることになる）
+        if adapter != "playwright_grow" and time.monotonic() > deadline:
+            # 途中で殺されるより、自分で止まって状態を残す方がよい。
+            # 残りは次回この続きから見るので、故障としては扱わない
+            break
         try:
-            pw and pw.stop()
-        except Exception:
-            pass
+            if adapter == "playwright_grow":
+                got = grow.get(url)
+                if got is None:
+                    # 時間内に届かなかっただけ。次回ここから始めるので
+                    # 故障としては鳴らさない（鳴らすと毎回名前が変わり、
+                    # 同じ不調で鳴り続ける）
+                    continue
+                checked += 1
+                if isinstance(got, Exception):
+                    raise got
+                fp, meta = got
+            else:
+                checked += 1
+                fp, meta = fetch_static_html(url, cfg)
+        except Exception as exc:
+            errors.append(f"{label or url}: {exc}")
+            continue
 
-    print(f"[{name}] 確認={checked}/{len(sources)} 変化={len(changes)} エラー={len(errors)}")
+        prev = state.get(url)
+        first = prev is None
+        reason = ""
+        if first:
+            # 予約枠は初回でも空きがあれば知らせる。ページ監視は知らせない
+            hit = adapter == "playwright_grow" and meta.get("slot_count", 0) > 0
+        elif adapter == "playwright_grow":
+            hit = prev != fp and meta.get("slot_count", 1) > 0
+        else:
+            # 単純な差ではなく「何が変わったか」で判断する。
+            # 出勤表の窓が毎朝ずれるだけで鳴っていた
+            hit, reason = static_changed(prev, fp)
+
+        previous[url] = prev
+        state[url] = fp
+        # 1 件ごとに書き出す。実行が途中で殺されても進捗が消えないように。
+        # 以前は最後にまとめて書いていたため、上限で殺されるたびに
+        # 状態が巻き戻り、同じ通知が 10 分おきに繰り返されていた
+        save_state()
+        if hit:
+            msg = format_message(templates, label or "", url, first)
+            if msg:
+                # 開いても何が変わったか分からない、を避ける
+                if reason:
+                    msg = f"{msg}\n{reason}"
+                changes.append((label or url, url, msg, first))
+
+    cursors[name] = (start + checked) % len(sources) if sources else 0
+    missed = len(sources) - checked
+    if missed:
+        # ログは認証が要るので、取りこぼしは注釈に出しておく
+        gh_warning(f"{name}: {missed}/{len(sources)} 件は時間内に確認できず、次回に回しました")
+    if sources and checked == 0:
+        # 1 件も見られないのは、遅いのではなく壊れている
+        errors.append(f"{name}: 1 件も確認できませんでした")
+    save_state()
+
+    print(f"[{name}] 確認={checked}/{len(sources)} 未確認={missed} 変化={len(changes)} エラー={len(errors)}")
     for e in errors:
         print(f"  error: {e}", file=sys.stderr)
 
